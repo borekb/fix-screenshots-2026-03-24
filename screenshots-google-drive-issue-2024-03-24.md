@@ -27,15 +27,19 @@ Jedná se o **známý problém** – Google doporučuje Google Drive na novém M
 
 ### Rozdíly mezi originálem a kopií " 2"
 
-|                              | Originály (cloud)                         | Kopie " 2" (migrované)       |
+|                              | Originals (bez " 2")                      | Kopie " 2"                    |
 | ---------------------------- | ----------------------------------------- | ----------------------------- |
 | Permissions                  | `-rw-r--r--` (479/482)                    | `-rw-------` (457/482)        |
-| Drive item ID                | jen 3 mají                                | 457 má                        |
-| macOS screenshot metadata    | ano (`kMDItemIsScreenCapture` atd.)        | ne                            |
+| Drive item ID                | 83                                        | většina                       |
+| `kMDItemIsScreenCapture`     | **490**                                   | 31                            |
+| `kMDItemScreenCaptureGlobalRect` | ano                                   | ne (až na 31 výjimek)         |
 | `com.apple.FinderInfo`       | ano                                       | ne                            |
+| `com.apple.quarantine`       | ano                                       | ne                            |
 
-Originály = soubory streamované z cloudu (jak Google Drive normálně funguje).
-Kopie " 2" = soubory uploadnuté z lokální cache, kterou přenesl Migration Assistant.
+**Opravená interpretace** (po hlubší analýze xattr):
+
+- **Originals (bez " 2") = soubory z Migration Assistant** – zachovaly si xattrs ze starého Maca (screenshot metadata, FinderInfo, quarantine). Většina nemá Google Drive item ID, protože GDrive je nepovažuje za "své" soubory.
+- **Kopie " 2" = cloud-downloaded verze** – GDrive je stáhl z cloudu jako konfliktní kopie. Mají Drive item ID, ale nemají screenshot xattrs (cloud je nepřenáší).
 
 ### 28 párů s odlišným obsahem
 
@@ -48,20 +52,75 @@ Rozlišení: pokud " 2" verze má jiné rozměry nebo výrazně jinou velikost, 
 
 **Stav:** Tyto páry je potřeba ještě projít a roztřídit.
 
-### Quick Look anomálie
+### Quick Look anomálie – vyřešeno
 
-Beyond Compare hlásí binárně identické soubory, ale Finder Quick Look zobrazuje originál menší a kopii " 2" 2x větší. Příčina je pravděpodobně **bug Finder thumbnail cache** – originál streamovaný z cloudu měl uloženou low-res miniaturu.
+Beyond Compare hlásí binárně identické soubory, ale Finder Quick Look zobrazuje originál (bez " 2") v "normální" velikosti a kopii " 2" **2× větší**. Mazání thumbnail cache nepomáhá, protože příčina je jinde.
 
-Řešení:
+**Příčina:** Rozdílné extended attributes (xattr), konkrétně `kMDItemScreenCaptureGlobalRect`.
 
-```bash
-qlmanage -r cache
-qlmanage -r
-killall Finder
-```
+Testovaný pár `Screenshot 2026-03-23 at 17.37.50.png`:
+- Soubory jsou byte-for-byte identické (MD5 `3e00c6f3d2447a5d45ca5429fb772c09`, 978×976 px, DPI 144, Display P3)
+- Originál má xattr `kMDItemScreenCaptureGlobalRect` = `[226, 228, 489, 488]` – tj. logická velikost **489×488 bodů** (= 978÷2 × 976÷2)
+- Quick Look čte tento xattr a zobrazí screenshot v logické velikosti (respektuje Retina 2× škálování)
+- Kopie " 2" tento xattr nemá → Quick Look zobrazí v plné pixelové velikosti 978×976, což vypadá 2× větší
+
+**Závěr:** Nejde o bug thumbnail cache, ale o chybějící metadata. Quick Look se chová korektně v obou případech – problém je, že kopie " 2" přišla o informaci o tom, že jde o Retina screenshot.
+
+## Kde se extended attributes ukládají
+
+Extended attributes (xattr) jsou metadata uložená **ve filesystému** (APFS), odděleně od datového obsahu souboru:
+
+- **Malé xattrs** (do ~3800 B): uloženy přímo v metadata oblasti APFS spolu se záznamem o xattr
+- **Větší xattrs**: uloženy jako separátní datové streamy, ale stále mimo hlavní datový obsah souboru
+
+Klíčový důsledek: xattrs jsou **lokální záležitost**. Nejsou součástí bytového obsahu souboru (PNG dat), takže se nepřenesou při uploadu/downloadu, pokud to cloud služba explicitně nepodporuje.
+
+### Cloud služby a xattrs
+
+| Služba       | Podpora xattrs |
+|-------------|----------------|
+| Google Drive | **NE** |
+| OneDrive     | NE |
+| Box          | NE |
+| Dropbox      | Částečně (některé `com.apple.*`) |
+| iCloud Drive | Částečně (Apple tvrdí plnou podporu, realita je omezená) |
+
+Zdroj: [Eclectic Light Company – Which file systems and Cloud services preserve extended attributes?](https://eclecticlight.co/2018/01/12/which-file-systems-and-cloud-services-preserve-extended-attributes/)
+
+### Co je uvnitř PNG (přežije cloud sync)
+
+PNG soubor samotný obsahuje informaci o tom, že je to screenshot:
+- **EXIF chunk** (`eXIf`): `UserComment: Screenshot`
+- **XMP chunk** (`iTXt`): `<exif:UserComment>Screenshot</exif:UserComment>`
+- **pHYs chunk**: DPI 144 (= Retina 2×)
+- **iDOT chunk**: Apple-proprietární chunk pro optimalizované renderování
+- **iCCP chunk**: ICC profil Display P3
+
+Tyto data přežijí sync přes jakýkoli cloud, protože jsou součástí PNG bytů. **Ale macOS Quick Look je nečte** – místo toho se spoléhá na xattrs (`kMDItemScreenCaptureGlobalRect`), které jsou uloženy ve filesystému a cloud sync nepřežijí.
+
+### Proč to dosud nebyl problém
+
+Při normálním používání GDrive na jednom Macu:
+1. Screenshot tool uloží soubor → nastaví xattrs (`kMDItemIsScreenCapture`, `kMDItemScreenCaptureGlobalRect` atd.)
+2. GDrive uploadne bytový obsah souboru (bez xattrs) do cloudu
+3. Lokální soubor si xattrs ponechá, protože je stále ten samý soubor na tom samém APFS disku
+4. Quick Look čte lokální xattrs → zobrazí správně
+
+**Na jiném Macu** (čistý GDrive download bez migrace) by soubor xattrs neměl a Quick Look by ho zobrazil 2× větší. Ale to zřejmě dosud nebylo viditelné, protože screenshoty byly primárně prohlíženy na Macu, kde vznikly.
+
+Ověřeno: soubor `Screenshot 2025-01-02 at 0.06.00.png` v podsložce `2025/` (čistý cloud download, nikdy nemigrovaný) má pouze `com.google.drivefs.item-id` a `lastuseddate` – **žádné screenshot xattrs**. Na tomto Macu je navíc Spotlight vypnutý, takže ani ten xattrs z PNG obsahu neregeneruje.
+
+### Teoretická náprava
+
+Pokud bychom chtěli obnovit xattrs na kopie " 2" (nebo obecně na soubory stažené z cloudu), šlo by:
+1. Z PNG obsahu extrahovat EXIF `UserComment: Screenshot` a XMP data
+2. Z `pHYs` chunku spočítat logickou velikost (pixely ÷ (DPI ÷ 72))
+3. Nastavit `kMDItemIsScreenCapture`, `kMDItemScreenCaptureType`, `kMDItemScreenCaptureGlobalRect` xattrs
+
+V praxi to ale není potřeba, pokud kopie " 2" budeme mazat.
 
 ## Další kroky
 
 - [ ] Smazat 454 identických duplikátů " 2"
 - [ ] Projít 28 párů s odlišným obsahem a roztřídit na Shottr anotace vs. re-procesované duplikáty
-- [ ] Promazat Finder thumbnail cache
+- [ ] Zvážit, zda si ponechat originals (migrované, s xattrs) nebo kopie " 2" (cloud-tracked, bez xattrs) – viz sekce výše
